@@ -179,12 +179,18 @@ function findCloseBracket(text, openIdx) {
     const ch = text[i];
     if (ch === '\\') { i += 2; continue; }
     if (ch === '`') {
-      // skip a code span so brackets inside code do not count
+      // skip a code unit so brackets inside it do not count: for
+      // bracket matching a unit is a backtick run, backtick-free
+      // content, and any closing run (its length need not match)
       let run = 1;
       while (text[i + run] === '`') run++;
-      const closeSeq = '`'.repeat(run);
-      const end = text.indexOf(closeSeq, i + run);
-      if (end !== -1) { i = end + run; continue; }
+      let j = i + run;
+      while (j < text.length && text[j] !== '`') j++;
+      if (j < text.length) {
+        let r2 = 1;
+        while (text[j + r2] === '`') r2++;
+        i = j + r2; continue;
+      }
       i += run; continue;
     }
     if (ch === '<') {
@@ -317,67 +323,208 @@ const ALNUM_RE = /[\p{L}\p{N}]/u;
 // Build the masked copy of an inline run: code spans, links, reference
 // links that resolve, autolinks and tags collapse to [aaa...] of the same
 // length, and backslash-escaped punctuation becomes '+' characters.
+// The masked twin of an inline text, used by the emphasis matcher so
+// delimiters inside other constructs stay invisible. It is built in
+// three length-preserving passes, in the same order the reference
+// lexer masks its source: resolvable reference links first, then
+// escaped punctuation and the defusing of backticks inside code spans,
+// then inline links, code spans and tags.
 function maskSource(text, links) {
+  let s = text;
+  if (s.includes('[')) s = maskReflinks(s, links);
+  s = defuseInline(s);
+  s = maskBlockSkip(s);
+  return s;
+}
+
+function maskSpan(a, b) {
+  // [aaa...] covering s[a..b] inclusive, keeping the total length
+  const len = b - a + 1;
+  return len >= 2 ? '[' + 'a'.repeat(len - 2) + ']' : 'a'.repeat(len);
+}
+
+// Pass 1: mask reference-style links whose label resolves. A candidate
+// whose text itself holds a link is not flattened; only the links
+// inside it are masked (images are exempt from that rule).
+function maskReflinks(s, links) {
   let out = '';
   let i = 0;
-  const n = text.length;
+  const n = s.length;
   while (i < n) {
-    const ch = text[i];
-    if (ch === '\\' && i + 1 < n && PUNCT_RE.test(text[i + 1])) { out += '++'; i += 2; continue; }
-    if (ch === '`') {
-      let run = 1;
-      while (text[i + run] === '`') run++;
-      const close = findCodeClose(text, i + run, run);
+    const isImg = s[i] === '!' && s[i + 1] === '[';
+    if (s[i] === '[' || isImg) {
+      const open = isImg ? i + 1 : i;
+      const close = findCloseBracket(s, open);
       if (close !== -1) {
-        const len = close + run - i;
-        out += '[' + 'a'.repeat(Math.max(0, len - 2)) + ']';
-        i += len; continue;
-      }
-      out += ch; i++; continue;
-    }
-    if (ch === '<') {
-      const m = /^<[^<>]*?>/.exec(text.slice(i));
-      if (m) { out += '[' + 'a'.repeat(Math.max(0, m[0].length - 2)) + ']'; i += m[0].length; continue; }
-      out += ch; i++; continue;
-    }
-    if (ch === '[' || (ch === '!' && text[i + 1] === '[')) {
-      const open = ch === '!' ? i + 1 : i;
-      // a label with a nested unescaped '[' cannot itself be a link here
-      let nested = false;
-      for (let k = open + 1; k < n; k++) {
-        if (text[k] === '\\') { k++; continue; }
-        if (text[k] === '`') {
-          let r = 1;
-          while (text[k + r] === '`') r++;
-          const cc = findCodeClose(text, k + r, r);
-          k = cc === -1 ? k + r : cc + r - 1;
+        const label = s.slice(open + 1, close);
+        let end = -1;
+        let refText = null;
+        if (s[close + 1] === '[' && s[close + 2] === ']') {
+          refText = label;
+          end = close + 2;
+        } else if (s[close + 1] === '[') {
+          const c2 = findCloseBracket(s, close + 1);
+          if (c2 !== -1) { refText = s.slice(close + 2, c2); end = c2; }
+        } else if (s[close + 1] !== '(') {
+          refText = label;
+          end = close;
+        }
+        if (end !== -1 && refText !== null && links.has(normLabel(refText))) {
+          if (!isImg && containsLink(label, links)) {
+            out += s.slice(i, open + 1) + maskReflinks(label, links);
+            out += s[close] === ']' ? ']' : ']';
+            if (end > close) out += '[' + 'a'.repeat(end - close - 2 >= 0 ? end - close - 2 : 0) + (end - close >= 2 ? ']' : '');
+            i = end + 1;
+            continue;
+          }
+          out += maskSpan(i, end);
+          i = end + 1;
           continue;
         }
-        if (text[k] === '[') { nested = true; break; }
-        if (text[k] === ']') break;
       }
-      const close = nested ? -1 : findCloseBracket(text, open);
+      out += s[i]; i++; continue;
+    }
+    out += s[i]; i++;
+  }
+  return out;
+}
+
+// Pass 2: escaped punctuation becomes '+', and backticks inside a code
+// span become '+' (the delimiters stay), so later passes can treat the
+// span's content as backtick-free.
+function defuseInline(s) {
+  let out = '';
+  let i = 0;
+  const n = s.length;
+  while (i < n) {
+    const ch = s[i];
+    if (ch === '\\' && i + 1 < n) {
+      const pair = s.slice(i + 1, i + 3);
+      const pm = /^[\p{P}\p{S}]/u.exec(pair);
+      if (pm) {
+        const len = 1 + pm[0].length;
+        out += '+'.repeat(len);
+        i += len;
+        continue;
+      }
+      out += ch; i++; continue;
+    }
+    if (ch === '`') {
+      let run = 1;
+      while (s[i + run] === '`') run++;
+      const close = findCodeClose(s, i + run, run);
       if (close !== -1) {
-        let end = -1;
-        if (text[close + 1] === '(') {
-          const d = parseLinkDest(text, close + 1);
-          if (d) end = d.end;
-        } else if (text[close + 1] === '[') {
-          const c2 = findCloseBracket(text, close + 1);
-          if (c2 !== -1) {
-            const ref = text.slice(close + 2, c2);
-            const label = text.slice(open + 1, close);
-            if (links.has(normLabel(ref === '' ? label : ref))) end = c2 + 1;
-          }
-        } else {
-          const label = text.slice(open + 1, close);
-          if (links.has(normLabel(label))) end = close + 1;
-        }
+        out += '`'.repeat(run);
+        out += s.slice(i + run, close).replace(/`/g, '+');
+        out += '`'.repeat(run);
+        i = close + run;
+        continue;
+      }
+      out += '`'.repeat(run);
+      i += run;
+      continue;
+    }
+    out += ch; i++;
+  }
+  return out;
+}
+
+// The label scan for masking: no brackets may appear in a label, but
+// code units (a run, backtick-free content, the same run) may.
+function blockSkipLabelEnd(s, open) {
+  let j = open + 1;
+  while (j < s.length) {
+    const c = s[j];
+    if (c === ']') return j;
+    if (c === '[') return -1;
+    if (c === '`') {
+      let run = 1;
+      while (s[j + run] === '`') run++;
+      let k = j + run;
+      while (k < s.length && s[k] !== '`') k++;
+      if (k >= s.length) return -1;
+      let r2 = 1;
+      while (s[k + r2] === '`') r2++;
+      if (r2 !== run) return -1;
+      j = k + r2;
+      continue;
+    }
+    j++;
+  }
+  return -1;
+}
+
+// The destination scan for masking: an opening paren, then escaped
+// characters, plain characters, or one nested paren pair, to the
+// closing paren.
+function blockSkipDestEnd(s, openParen) {
+  let depth = 0;
+  let j = openParen;
+  while (j < s.length) {
+    const c = s[j];
+    if (c === '\\') { j += 2; continue; }
+    if (c === '(') {
+      depth++;
+      if (depth > 2) return -1;
+      j++;
+      continue;
+    }
+    if (c === ')') {
+      depth--;
+      j++;
+      if (depth === 0) return j - 1;
+      continue;
+    }
+    j++;
+  }
+  return -1;
+}
+
+// Pass 3: mask inline links, code spans and tags.
+function maskBlockSkip(s) {
+  let out = '';
+  let i = 0;
+  const n = s.length;
+  while (i < n) {
+    const ch = s[i];
+    const isImg = ch === '!' && s[i + 1] === '[';
+    if (ch === '[' || isImg) {
+      const open = isImg ? i + 1 : i;
+      const close = blockSkipLabelEnd(s, open);
+      if (close !== -1 && s[close + 1] === '(') {
+        const end = blockSkipDestEnd(s, close + 1);
         if (end !== -1) {
-          const len = end - i;
-          out += '[' + 'a'.repeat(Math.max(0, len - 2)) + ']';
-          i = end; continue;
+          out += maskSpan(i, end);
+          i = end + 1;
+          continue;
         }
+      }
+      out += ch; i++; continue;
+    }
+    if (ch === '`') {
+      let run = 1;
+      while (s[i + run] === '`') run++;
+      let j = i + run;
+      while (j < n && s[j] !== '`') j++;
+      if (j < n) {
+        let r2 = 1;
+        while (s[j + r2] === '`') r2++;
+        if (r2 === run) {
+          out += maskSpan(i, j + r2 - 1);
+          i = j + r2;
+          continue;
+        }
+      }
+      out += '`'.repeat(run);
+      i += run;
+      continue;
+    }
+    if (ch === '<' && s[i + 1] !== ' ') {
+      const m = /^<[^<>]*?>/.exec(s.slice(i));
+      if (m) {
+        out += maskSpan(i, i + m[0].length - 1);
+        i += m[0].length;
+        continue;
       }
       out += ch; i++; continue;
     }
@@ -386,7 +533,6 @@ function maskSource(text, links) {
   return out;
 }
 
-// Find the end of a code span: a run of exactly `run` backticks.
 function findCodeClose(text, from, run) {
   let i = from;
   while (i < text.length) {
@@ -554,6 +700,8 @@ function parseInline(text, links, inLink) {
       if (tag) {
         flush();
         parts.push({ html: tag[0] });
+        if (!docInLink && /^<a /i.test(tag[0])) docInLink = true;
+        else if (docInLink && /^<\/a>/i.test(tag[0])) docInLink = false;
         i += tag[0].length; continue;
       }
       buf += ch; i++; continue;
@@ -591,7 +739,7 @@ function parseInline(text, links, inLink) {
       }
       buf += ch; i++; continue;
     }
-    if ((ch === 'w' || ch === 'h' || ch === 'f') && (i === 0 || !isAlnumCh(text[i - 1])) && !inLink) {
+    if ((ch === 'w' || ch === 'h' || ch === 'f' || ch === 'W' || ch === 'H' || ch === 'F') && (i === 0 || !isAlnumCh(text[i - 1])) && !inLink && !docInLink) {
       const auto = matchExtendedAutolink(text, i);
       if (auto && (auto.text.startsWith('www.') || auto.text.includes('://'))) {
         flush();
@@ -599,7 +747,7 @@ function parseInline(text, links, inLink) {
         i = auto.end; continue;
       }
     }
-    if ((ch === 'm' || ch === 'x') && !inLink && (i === 0 || !isAlnumCh(text[i - 1]))
+    if ((ch === 'm' || ch === 'x') && !inLink && !docInLink && (i === 0 || !isAlnumCh(text[i - 1]))
       && (text.startsWith('mailto:', i) || text.startsWith('xmpp:', i))) {
       const auto = matchExtendedAutolink(text, i);
       if (auto) {
@@ -608,7 +756,7 @@ function parseInline(text, links, inLink) {
         i = auto.end; continue;
       }
     }
-    if (isAlnumCh(ch) && !inLink) {
+    if (isAlnumCh(ch) && !inLink && !docInLink) {
       const prev = i > 0 ? text[i - 1] : '';
       if (!isAlnumCh(prev) && prev !== '.' && prev !== '_' && prev !== '%' && prev !== '+' && prev !== '-') {
         const auto = matchExtendedAutolink(text, i);
@@ -659,8 +807,10 @@ function tryFormLink(text, openIdx, isImage, links) {
   }
   if (!isImage && containsLink(labelText, links)) return null;
   const hrefAttr = escHtml(cleanHref(unescapePunct(href)), true);
+  const savedInLink = docInLink;
   if (isImage) {
     const innerHtml = parseInline(labelText, links, false);
+    docInLink = savedInLink;
     const alt = innerHtml.replace(/<img[^>]*? alt="([^"]*)"[^>]*?>/g, '$1').replace(/<[^>]*>/g, '');
     let html = '<img src="' + hrefAttr + '" alt="' + alt + '"';
     if (title !== null) html += ' title="' + escHtml(cleanTitle(title), true) + '"';
@@ -669,6 +819,7 @@ function tryFormLink(text, openIdx, isImage, links) {
   let html = '<a href="' + hrefAttr + '"';
   if (title !== null) html += ' title="' + escHtml(cleanTitle(title), true) + '"';
   html += '>' + parseInline(labelText, links, true) + '</a>';
+  docInLink = savedInLink;
   return { html, end };
 }
 
@@ -682,9 +833,20 @@ function containsLink(labelText, links) {
     if (ch === '\\') { i++; continue; }
     if (ch === '[') {
       if (i > 0 && labelText[i - 1] === '!') {
+        // an image never counts as a nested link: skip its whole form,
+        // including a destination or reference part, so the reference
+        // bracket is not misread as a shortcut link
         const c0 = findCloseBracket(labelText, i);
         if (c0 === -1) return false;
-        i = c0;
+        let end = c0;
+        if (labelText[end + 1] === '(') {
+          const d = parseLinkDest(labelText, end + 1);
+          if (d) end = d.end - 1;
+        } else if (labelText[end + 1] === '[') {
+          const c2 = findCloseBracket(labelText, end + 1);
+          if (c2 !== -1) end = c2;
+        }
+        i = end;
         continue;
       }
       const close = findCloseBracket(labelText, i);
@@ -730,6 +892,23 @@ function leadingIndent(line) {
   }
   return { cols: col, idx: i };
 }
+// Remove one indented-code unit from a line: up to three spaces
+// followed by a tab, or one to four spaces. A tab met inside the unit
+// is consumed whole and ends it, so a tab after four spaces survives.
+function dedentCode(line) {
+  let i = 0, spaces = 0;
+  while (i < line.length) {
+    if (line[i] === ' ') {
+      if (spaces === 4) break;
+      spaces++; i++;
+    } else if (line[i] === '\t') {
+      if (spaces <= 3) i++;
+      break;
+    } else break;
+  }
+  return line.slice(i);
+}
+
 function stripCols(line, cols) {
   // Expand the leading whitespace run to plain spaces (tabs run to the
   // next multiple-of-four column), then drop `cols` of them. Whitespace
@@ -963,30 +1142,34 @@ function htmlBlockStart(line) {
   return 0;
 }
 
-// Split a table row into cells, honouring \| escapes and code spans.
+// Split a table row into cells. A pipe is a delimiter unless it is
+// preceded by an odd number of backslashes; code spans do not protect
+// pipes. Delimiters are marked by inserting a space, the row is split
+// on space+pipe, empty edge cells (from leading/trailing pipes) are
+// dropped, and escaped pipes unfold to literal pipes in the cells.
 function splitRow(line) {
-  let s = line.trim();
-  if (s.startsWith('|')) s = s.slice(1);
-  if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1);
-  const cells = [];
-  let cur = '';
-  let i = 0;
-  while (i < s.length) {
-    const ch = s[i];
-    if (ch === '\\' && s[i + 1] === '|') { cur += '|'; i += 2; continue; }
-    if (ch === '`') {
-      let run = 1;
-      while (s[i + run] === '`') run++;
-      const seq = '`'.repeat(run);
-      const end = s.indexOf(seq, i + run);
-      if (end !== -1) { cur += s.slice(i, end + run); i = end + run; continue; }
-      cur += seq; i += run; continue;
+  let markedStr = '';
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] === '|') {
+      let bs = 0;
+      for (let k = i - 1; k >= 0 && line[k] === '\\'; k--) bs++;
+      markedStr += bs % 2 === 1 ? '|' : ' |';
+    } else {
+      markedStr += line[i];
     }
-    if (ch === '|') { cells.push(cur); cur = ''; i++; continue; }
-    cur += ch; i++;
   }
-  cells.push(cur);
+  const cells = markedStr.split(' |');
+  if (cells.length && !cells[0].trim()) cells.shift();
+  if (cells.length && !cells[cells.length - 1].trim()) cells.pop();
   return cells.map((c) => c.trim().replace(/\\\|/g, '|'));
+}
+
+function tableRowContinues(l) {
+  if (/^ *$/.test(l)) return false;
+  if (startsBlock(l, true)) return false;
+  const cm = /^(?: {4}| {0,3}\t)/.exec(l);
+  if (cm && cm[0].length < l.length) return false;
+  return true;
 }
 
 function parseTable(lines, i, links) {
@@ -1008,7 +1191,7 @@ function parseTable(lines, i, links) {
   }
   const rows = [];
   let j = i + 2;
-  while (j < lines.length && !isBlankLine(lines[j]) && !startsBlock(lines[j], true)) {
+  while (j < lines.length && tableRowContinues(lines[j])) {
     rows.push(splitRow(lines[j]));
     j++;
   }
@@ -1185,27 +1368,41 @@ function renderList(nd, links) {
 }
 
 // Does the quote content gathered so far end with a block after which a
-// lazy continuation cannot follow (code, heading, rule, HTML, fence)?
+// lazy continuation cannot follow (code, heading, rule, HTML, table)?
+// The gathered lines are scanned with a light block tracker: fence and
+// HTML-block state carry over lines, and the kind of the most recent
+// block decides.
 function quoteChunkIsBlocky(inner) {
-  for (let k = inner.length - 1; k >= 0; k--) {
-    const l = inner[k];
-    if (l === '') continue;
-    if (FENCE_RE.test(l) || ATX_RE.test(l) || HR_RE.test(l)) return true;
-    if (htmlBlockStart(l) >= 1) return true;
-    if (leadingIndent(l).cols >= 4) {
-      // an indented run is a real code block unless it directly
-      // continues a paragraph line, in which case it is merged text
-      let m = k;
-      while (m >= 0 && leadingIndent(inner[m]).cols >= 4) m--;
-      if (m < 0 || inner[m] === '') return true;
-      const before = inner[m];
-      if (FENCE_RE.test(before) || ATX_RE.test(before) || HR_RE.test(before)) return true;
-      if (htmlBlockStart(before) >= 1) return true;
-      return false;
+  let last = 'none';
+  let fence = null;
+  let inHtml = false;
+  let inTable = false;
+  let prevLine = '';
+  for (const l of inner) {
+    if (fence) {
+      if (fenceCloseRe(fence).test(l)) fence = null;
+      last = 'code';
+      continue;
     }
-    return false;
+    if (isBlankLine(l)) { inHtml = false; inTable = false; continue; }
+    if (inHtml) { last = 'html'; prevLine = l; continue; }
+    if (inTable) {
+      if (startsBlock(l, true)) { inTable = false; }
+      else { last = 'table'; prevLine = l; continue; }
+    }
+    const fm = FENCE_RE.exec(l);
+    if (fm) { fence = fm[1] || fm[3]; last = 'code'; prevLine = l; continue; }
+    if (ATX_RE.test(l)) { last = 'heading'; prevLine = l; continue; }
+    if (HR_RE.test(l)) { last = 'hr'; prevLine = l; continue; }
+    if (htmlBlockStart(l) >= 1) { inHtml = true; last = 'html'; prevLine = l; continue; }
+    if (prevLine.includes('|') && /^[ \t]*\|?[ \t:|-]+$/.test(l) && l.includes('-')) { inTable = true; last = 'table'; prevLine = l; continue; }
+    if (leadingIndent(l).cols >= 4 && last !== 'para' && last !== 'list' && last !== 'quote') { last = 'code'; prevLine = l; continue; }
+    if (QUOTE_RE.test(l)) { last = 'quote'; prevLine = l; continue; }
+    if (LIST_RE.test(l)) { last = 'list'; prevLine = l; continue; }
+    last = 'para';
+    prevLine = l;
   }
-  return false;
+  return last === 'code' || last === 'heading' || last === 'hr' || last === 'html' || last === 'table';
 }
 
 function parseBlocks(src, links, inItem = false, lazyMap = null) {
@@ -1235,11 +1432,22 @@ function parseBlocks(src, links, inItem = false, lazyMap = null) {
     if (fm) {
       const marker = fm[1] || fm[3];
       const info = (fm[1] ? fm[2] : fm[4]).trim();
-      const fenceIndent = leadingIndent(line).cols;
+      // compensation removes whitespace characters (never expanded
+      // tabs), at most the number the opening fence itself is
+      // indented by, and only for backtick fences
+      const fenceWs = fm[1] ? /^[ \t]*/.exec(line)[0].length : 0;
       const closeRe = fenceCloseRe(marker);
       const body = [];
       let j = i + 1;
-      while (j < lines.length && !closeRe.test(lines[j])) { body.push(stripCols(lines[j], fenceIndent)); j++; }
+      while (j < lines.length && !closeRe.test(lines[j])) {
+        const bl = lines[j];
+        if (fenceWs === 0) body.push(bl);
+        else {
+          const lead = /^[ \t]*/.exec(bl)[0].length;
+          body.push(bl.slice(Math.min(lead, fenceWs)));
+        }
+        j++;
+      }
       if (j < lines.length) j++;
       let content = body.join('\n');
       content = content ? content.replace(/\n$/, '') + '\n' : '';
@@ -1362,8 +1570,8 @@ function parseBlocks(src, links, inItem = false, lazyMap = null) {
       let j = i;
       while (j < lines.length) {
         const l = lines[j];
-        if (isBlankLine(l)) { body.push(stripCols(l, 4)); j++; continue; }
-        if (leadingIndent(l).cols >= 4) { body.push(stripCols(l, 4)); j++; continue; }
+        if (isBlankLine(l)) { body.push(dedentCode(l)); j++; continue; }
+        if (leadingIndent(l).cols >= 4) { body.push(dedentCode(l)); j++; continue; }
         break;
       }
       while (body.length && isBlankLine(body[body.length - 1])) body.pop();
@@ -1390,12 +1598,16 @@ function parseBlocks(src, links, inItem = false, lazyMap = null) {
         // to four columns removed, as an indented block cannot
         // interrupt a paragraph; the removal continues over the run of
         // indented lazy lines and stops at the first outdented one
-        if (leadingIndent(l).cols >= 4) { lazyStrip = true; paraLines.push(stripCols(l, 4)); j++; continue; }
+        if (leadingIndent(l).cols >= 4) { lazyStrip = true; paraLines.push(dedentCode(l)); j++; continue; }
         lazyStrip = false;
-      } else if (inItem && leadingIndent(l).cols >= 4 && !startsBlock(l, true)) { paraLines.push(stripCols(l, 4)); j++; continue; }
+      } else if (inItem && leadingIndent(l).cols >= 4 && !startsBlock(l, true)) { paraLines.push(dedentCode(l)); j++; continue; }
       const sm = SETEXT_RE.exec(l);
       if (sm && paraLines.length >= 1) { setextDepth = sm[1][0] === '=' ? 1 : 2; j++; break; }
       if (startsBlock(l, true)) break;
+      // inside a list item the content is lexed line by line, so a
+      // list marker with any number interrupts the paragraph (at the
+      // top level only a list starting at 1 can do that)
+      if (inItem && LIST_RE.test(l)) break;
       // a table can interrupt: header + delimiter
       if (l.includes('|') && j + 1 < lines.length && /^[ \t]*\|?[ \t:|-]+$/.test(lines[j + 1]) && lines[j + 1].includes('-')) break;
       paraLines.push(l);
@@ -1429,7 +1641,10 @@ function renderBlocks(nodes, tight, links) {
 
 // Public entry: render one Markdown document to the exact HTML the
 // reference renderer produces for it.
+let docInLink = false;
+
 export function parse(markdown) {
+  docInLink = false;
   const src = String(markdown).replace(/\r\n|\r/g, '\n');
   const links = new Map();
   const nodes = parseBlocks(src, links);
