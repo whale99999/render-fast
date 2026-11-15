@@ -171,42 +171,63 @@ function parseLinkDest(text, openIdx) {
 
 // Find the ']' matching the '[' at openIdx, honouring nesting and escapes.
 // Returns index of the matching ']' or -1.
-function findCloseBracket(text, openIdx) {
-  let depth = 0;
-  let i = openIdx;
+// Yield the positions where the bracket opened at openIdx can close
+// under the rich label grammar, most preferred parse first. A backtick
+// run that could complete a code unit is consumed as a unit on the
+// preferred path; when the run has length 2+ directly before a ']',
+// treating the run as literal text is kept as a fallback path (the
+// reference grammar backtracks into it when the unit parse cannot
+// complete the surrounding link).
+function* labelCloseCandidates(text, openIdx) {
   const n = text.length;
-  while (i < n) {
-    const ch = text[i];
-    if (ch === '\\') { i += 2; continue; }
-    if (ch === '`') {
-      // skip a code unit so brackets inside it do not count: for
-      // bracket matching a unit is a backtick run, backtick-free
-      // content, and any closing run (its length need not match)
-      let run = 1;
-      while (text[i + run] === '`') run++;
-      let j = i + run;
-      while (j < text.length && text[j] !== '`') j++;
-      if (j < text.length) {
-        let r2 = 1;
-        while (text[j + r2] === '`') r2++;
-        i = j + r2; continue;
+  const seen = new Set();
+  const stack = [[openIdx, 0]];
+  while (stack.length) {
+    const start = stack.pop();
+    let i = start[0];
+    let depth = start[1];
+    const branches = [];
+    let candidate = -1;
+    while (i < n) {
+      const ch = text[i];
+      if (ch === '\\') { i += 2; continue; }
+      if (ch === '`') {
+        let run = 1;
+        while (text[i + run] === '`') run++;
+        let j = i + run;
+        while (j < n && text[j] !== '`') j++;
+        if (j < n) {
+          if (depth <= 1 && run >= 2 && text[i + run] === ']') branches.push([i + run, depth]);
+          let r2 = 1;
+          while (text[j + r2] === '`') r2++;
+          i = j + r2; continue;
+        }
+        if (depth <= 1) {
+          if (run >= 2 && text[i + run] === ']') { i += run; continue; }
+          break;
+        }
+        i += run; continue;
       }
-      i += run; continue;
+      if (ch === '<') {
+        const rest = text.slice(i);
+        const skip = /^<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*>/.exec(rest) || HTML_TAG_RE.exec(rest);
+        if (skip) { i += skip[0].length; continue; }
+        i++; continue;
+      }
+      if (ch === '[') depth++;
+      else if (ch === ']') {
+        depth--;
+        if (depth === 0) { candidate = i; break; }
+      }
+      i++;
     }
-    if (ch === '<') {
-      // skip an autolink or a tag so brackets inside it do not count
-      const rest = text.slice(i);
-      const skip = /^<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*>/.exec(rest) || HTML_TAG_RE.exec(rest);
-      if (skip) { i += skip[0].length; continue; }
-      i++; continue;
-    }
-    if (ch === '[') depth++;
-    else if (ch === ']') {
-      depth--;
-      if (depth === 0) return i;
-    }
-    i++;
+    if (candidate !== -1 && !seen.has(candidate)) { seen.add(candidate); yield candidate; }
+    for (let b = branches.length - 1; b >= 0; b--) stack.push(branches[b]);
   }
+}
+
+function findCloseBracket(text, openIdx) {
+  for (const c of labelCloseCandidates(text, openIdx)) return c;
   return -1;
 }
 
@@ -779,32 +800,75 @@ function parseInline(text, links, inLink) {
 // scanner attempts a link at the bracket itself: inline destination
 // first, then a full or collapsed reference, then a shortcut reference.
 // A link whose label itself contains a link never forms.
-function tryFormLink(text, openIdx, isImage, links) {
-  const close = findCloseBracket(text, openIdx);
-  if (close === -1) return null;
-  const labelText = text.slice(openIdx + 1, close);
-  const after = close + 1;
-  let href = null, title = null, end = -1;
-  if (text[after] === '(') {
-    const d = parseLinkDest(text, after);
-    if (d) { href = d.href; title = d.title; end = d.end; }
-  }
-  let refAttempted = false;
-  if (end === -1 && text[after] === '[') {
-    const close2 = findCloseBracket(text, after);
-    if (close2 !== -1) {
-      refAttempted = true;
-      const refLabel = text.slice(after + 1, close2);
-      const def = links.get(normLabel(refLabel === '' ? labelText : refLabel));
-      if (def) { href = def.href; title = def.title; end = close2 + 1; }
+// Bracket matching with the simple label grammar (used for shortcut
+// references when the rich grammar fails): backticks are ordinary
+// characters, only escapes and bracket balance matter.
+function findCloseBracketSimple(text, openIdx) {
+  let depth = 0;
+  let i = openIdx;
+  const n = text.length;
+  while (i < n) {
+    const ch = text[i];
+    if (ch === '\\') { i += 2; continue; }
+    if (ch === '[') depth++;
+    else if (ch === ']') {
+      depth--;
+      if (depth === 0) return i;
     }
+    i++;
   }
-  if (end === -1 && refAttempted) return null;
-  if (end === -1) {
+  return -1;
+}
+
+function tryFormLink(text, openIdx, isImage, links) {
+  // Try each label parse in preference order. A parse whose tail does
+  // not complete (no destination, no reference bracket) falls through
+  // to the next parse; a completed parse whose definition lookup fails
+  // ends the attempt, as does a shortcut lookup.
+  let tried = 0;
+  for (const close of labelCloseCandidates(text, openIdx)) {
+    if (++tried > 12) break;
+    const labelText = text.slice(openIdx + 1, close);
+    const after = close + 1;
+    if (text[after] === '(') {
+      const d = parseLinkDest(text, after);
+      if (!d) continue;
+      return finishLink(labelText, d.href, d.title, d.end, isImage, links);
+    }
+    if (text[after] === '[') {
+      const close2 = findCloseBracket(text, after);
+      if (close2 !== -1) {
+        const refLabel = text.slice(after + 1, close2);
+        const def = links.get(normLabel(refLabel === '' ? labelText : refLabel));
+        if (!def) return null;
+        return finishLink(labelText, def.href, def.title, close2 + 1, isImage, links);
+      }
+    }
     const def = links.get(normLabel(labelText));
     if (!def) return null;
-    href = def.href; title = def.title; end = after;
+    return finishLink(labelText, def.href, def.title, after, isImage, links);
   }
+  // No rich-grammar parse: a shortcut or collapsed reference may still
+  // form under the simple label grammar.
+  const closeS = findCloseBracketSimple(text, openIdx);
+  if (closeS === -1) return null;
+  const labelS = text.slice(openIdx + 1, closeS);
+  if (/\n[ \t]*\n/.test(labelS)) return null;
+  let endS = -1;
+  let defS = null;
+  if (text[closeS + 1] === '[' && text[closeS + 2] === ']') {
+    defS = links.get(normLabel(labelS));
+    if (defS) endS = closeS + 3;
+  }
+  if (endS === -1) {
+    defS = links.get(normLabel(labelS));
+    if (defS) endS = closeS + 1;
+  }
+  if (endS === -1 || !defS) return null;
+  return finishLink(labelS, defS.href, defS.title, endS, isImage, links);
+}
+
+function finishLink(labelText, href, title, end, isImage, links) {
   if (!isImage && containsLink(labelText, links)) return null;
   const hrefAttr = escHtml(cleanHref(unescapePunct(href)), true);
   const savedInLink = docInLink;
@@ -931,6 +995,16 @@ function expandWs(ws, startCol) {
   }
   return out;
 }
+// Drop trailing blank lines, but keep the string whole when no more
+// than two line elements follow the last content line.
+function trimTrailingBlankLines(str) {
+  const ls = str.split('\n');
+  let end = ls.length - 1;
+  while (end >= 0 && /^[ \t]*$/.test(ls[end])) end--;
+  if (ls.length - end <= 2) return str;
+  return ls.slice(0, end + 1).join('\n');
+}
+
 function isBlankLine(line) {
   return /^[ \t]*$/.test(line);
 }
@@ -1280,6 +1354,10 @@ function parseList(lines, i, links) {
     let sawBlank = false;
     let pendingBlanks = 0;
     let lastLine = firstContent;
+    // whether the last line pushed belongs to an indented code block:
+    // a content line still indented by 4+ after the item dedent, when
+    // it follows a blank line or another such line
+    let lastWasCode = false;
     while (j < lines.length) {
       const l = lines[j];
       if (isBlankLine(l)) { pendingBlanks++; j++; sawBlank = true; continue; }
@@ -1297,9 +1375,11 @@ function parseList(lines, i, links) {
       }
       const li = leadingIndent(l);
       if (li.cols >= contentIndent) {
+        const hadBlanks = pendingBlanks > 0;
         while (pendingBlanks > 0) { itemLines.push(''); pendingBlanks--; }
         const stripped = stripCols(l, contentIndent);
         itemLines.push(stripped);
+        lastWasCode = leadingIndent(stripped).cols >= 4 && (hadBlanks || lastWasCode);
         lastLine = stripped;
         j++;
         itemEnd = j;
@@ -1308,19 +1388,21 @@ function parseList(lines, i, links) {
       if (pendingBlanks > 0) break;
       // lazy continuation: only plain paragraph text may continue lazily,
       // and not after a line that was itself a block start or code
-      if (leadingIndent(lastLine).cols >= 4 || FENCE_RE.test(lastLine) || ATX_RE.test(lastLine)
+      if (lastWasCode || FENCE_RE.test(lastLine) || ATX_RE.test(lastLine)
         || HR_RE.test(lastLine) || (htmlBlockStart(lastLine) >= 1 && htmlBlockStart(lastLine) <= 6)) {
         break;
       }
       if (SETEXT_RE.test(l)) {
         itemLines.push('    ' + l.trim());
         lastLine = l;
+        lastWasCode = false;
         j++;
         itemEnd = j;
         continue;
       }
       itemLines.push(l);
       lastLine = l;
+      lastWasCode = false;
       j++;
       itemEnd = j;
     }
@@ -1554,14 +1636,22 @@ function parseBlocks(src, links, inItem = false, lazyMap = null) {
       } else {
         while (j < lines.length && !isBlankLine(lines[j])) { body.push(lines[j]); j++; }
       }
-      let raw = body.join('\n');
-      let tail = '';
-      if (j >= lines.length) {
-        if (src.endsWith('\n') && !src.endsWith('\n\n')) tail = '\n';
-      } else if (!isBlankLine(lines[j])) {
-        tail = '\n';
+      // The raw text the reference block rule captures also swallows
+      // following blank lines (only empty ones for types 1-5, any
+      // whitespace-only ones for types 6-7); trailing blank lines are
+      // then trimmed, keeping the whole string when at most two line
+      // elements follow the last content line.
+      const following = [];
+      if (hb <= 5) {
+        while (j + following.length < lines.length && lines[j + following.length] === '') following.push('');
+      } else {
+        while (j + following.length < lines.length && isBlankLine(lines[j + following.length])) following.push(lines[j + following.length]);
       }
-      nodes.push({ kind: 'htmlblock', raw, tail });
+      const consumed = body.concat(following);
+      const moreAfter = j + following.length < lines.length;
+      let cap0 = consumed.join('\n');
+      if (moreAfter || src.endsWith('\n')) cap0 += '\n';
+      nodes.push({ kind: 'html', html: trimTrailingBlankLines(cap0) });
       i = j; continue;
     }
     // indented code block
@@ -1628,7 +1718,7 @@ function renderBlocks(nodes, tight, links) {
     if (nd.kind === 'quote') out += '<blockquote>\n' + renderBlocks(nd.children, false, links) + '</blockquote>\n';
     else if (nd.kind === 'list') out += renderList(nd, links);
     else if (nd.kind === 'table') out += renderTable(nd, links);
-    else if (nd.kind === 'htmlblock') out += nd.raw + nd.tail;
+
     else if (nd.kind === 'html') out += nd.html;
     else if (nd.kind === 'heading') out += '<h' + nd.depth + '>' + parseInline(nd.text, links, false) + '</h' + nd.depth + '>\n';
     else if (nd.kind === 'para') {
