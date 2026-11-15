@@ -92,7 +92,7 @@ function cleanTitle(t) {
 // delimiter-run algorithm). Links are recognised during the scan; their
 // bracket nesting is tracked on a separate stack.
 
-const HTML_TAG_RE = /^<(?:[A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*(?:\s*=\s*(?:[^ \t"'=<>`]+|'[^']*'|"[^"]*"))?)*\s*\/?>|\/[A-Za-z][A-Za-z0-9-]*\s*>|!--(?:-?>|[\s\S]*?(?:-->|$))|\?[\s\S]*?\?>|![A-Za-z][\s\S]*?>|!\[CDATA\[[\s\S]*?\]\]>)/;
+const HTML_TAG_RE = /^<(?:!--(?:-?>|[\s\S]*?-->)|\/[A-Za-z][A-Za-z0-9-]*\s*>|[A-Za-z][A-Za-z0-9-]*(?:\s+[A-Za-z:_][\w.:-]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*?\s*\/?>|\?[\s\S]*?\?>|![A-Za-z]+\s[\s\S]*?>|!\[CDATA\[[\s\S]*?\]\]>)/;
 
 function isSpaceCh(ch) {
   return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v';
@@ -187,6 +187,13 @@ function findCloseBracket(text, openIdx) {
       if (end !== -1) { i = end + run; continue; }
       i += run; continue;
     }
+    if (ch === '<') {
+      // skip an autolink or a tag so brackets inside it do not count
+      const rest = text.slice(i);
+      const skip = /^<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*>/.exec(rest) || HTML_TAG_RE.exec(rest);
+      if (skip) { i += skip[0].length; continue; }
+      i++; continue;
+    }
     if (ch === '[') depth++;
     else if (ch === ']') {
       depth--;
@@ -204,45 +211,49 @@ function renderTextRun(s) {
   return out.indexOf('\u0001') === -1 ? out : out.replace(/\u0001/g, '&amp;');
 }
 
-// GFM extended autolink: try to match a bare URL / www / email at position i.
+// GFM extended autolinks: bare URLs, www addresses, mailto:/xmpp:
+// addresses and bare email addresses. The domain part of an email-style
+// address must end in an alphanumeric character, and a following word
+// character or hyphen vetoes the match outright (it is not a trim
+// point). The URL form is shortened by repeatedly keeping the longest
+// prefix that does not end in dangling punctuation, an entity, or an
+// unbalanced closing bracket.
+const BACKPEDAL = /^(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
+const EMAIL_CORE = '[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\\w-])';
+const MAILTO_RE = new RegExp('^mailto:' + EMAIL_CORE);
+const XMPP_RE = new RegExp('^xmpp:' + EMAIL_CORE + '(?:\\/[A-Za-z0-9@.]+)?');
+const EMAIL_RE = new RegExp('^' + EMAIL_CORE);
+const URL_FULL_RE = /^(?:(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.)(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/;
+
 function matchExtendedAutolink(text, i) {
   const rest = text.slice(i, i + 300);
-  let m = /^(?:https?:\/\/|ftp:\/\/|www\.)[^\s<]+/.exec(rest);
-  if (m) {
-    let link = m[0];
-    let changed = true;
-    while (changed && link.length > 0) {
-      changed = false;
-      const last = link[link.length - 1];
-      if ('?!.,:*_~'.includes(last)) { link = link.slice(0, -1); changed = true; continue; }
-      if (last === ';') {
-        const ent = /&(?:#\d+|#x[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);$/.exec(link);
-        link = ent ? link.slice(0, link.length - ent[0].length) : link.slice(0, -1);
-        changed = true; continue;
-      }
-      if (last === ')') {
-        let open = 0, close = 0;
-        for (const ch of link) { if (ch === '(') open++; else if (ch === ')') close++; }
-        if (close > open) { link = link.slice(0, -1); changed = true; continue; }
-      }
-      if (last === ']') {
-        let open = 0, close = 0;
-        for (const ch of link) { if (ch === '[') open++; else if (ch === ']') close++; }
-        if (close > open) { link = link.slice(0, -1); changed = true; continue; }
-      }
+  if (rest.startsWith('mailto:')) {
+    const m = MAILTO_RE.exec(rest);
+    if (m) return { href: m[0], text: m[0], end: i + m[0].length };
+    return null;
+  }
+  if (rest.startsWith('xmpp:')) {
+    const m = XMPP_RE.exec(rest);
+    if (m) return { href: m[0], text: m[0], end: i + m[0].length };
+    return null;
+  }
+  const um = URL_FULL_RE.exec(rest);
+  if (um) {
+    let cur = um[0];
+    for (;;) {
+      const b = BACKPEDAL.exec(cur);
+      const next = b ? b[0] : '';
+      if (next === cur || next === '') { cur = next; break; }
+      cur = next;
     }
-    if (link.length === 0) return null;
-    const isWww = link.startsWith('www.');
-    const href = isWww ? 'http://' + link : link;
-    return { href, text: link, end: i + link.length };
+    if (cur.startsWith('www.') ? cur.length > 4 : cur.includes('://')) {
+      const href = cur.startsWith('www.') ? 'http://' + cur : cur;
+      return { href, text: cur, end: i + cur.length };
+    }
+    return null;
   }
-  m = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/.exec(rest);
-  if (m) {
-    let link = m[0];
-    while (link.endsWith('.')) link = link.slice(0, -1);
-    if (!link) return null;
-    return { href: 'mailto:' + link, text: link, end: i + link.length };
-  }
+  const em = EMAIL_RE.exec(rest);
+  if (em) return { href: 'mailto:' + em[0], text: em[0], end: i + em[0].length };
   return null;
 }
 
@@ -286,8 +297,7 @@ function rDelimRegex(ch) {
     '|' + NPS + '(_+)(?!_)(?=' + PS + '|$)' +
     '|(?!_)' + PS + '(_+)(?=' + NPS + ')' +
     '|[\\s](_+)(?!_)(?=' + P + ')' +
-    '|(?!_)' + P + '(_+)(?!_)(?=' + P + ')' +
-    '|(?:(?!_)' + P + '|' + NPS + ')(_+)(?!_)(?=' + NPS + ')',
+    '|(?!_)' + P + '(_+)(?!_)(?=' + P + ')',
     'gu');
 }
 
@@ -406,14 +416,15 @@ function matchEmStrong(text, masked, i, prevChar) {
     else if (!/\s/.test(after)) nextIsNonSpace = true;
   }
   if (!nextIsPunct && !nextIsNonSpace) return null;
-  if (ch === '_' && nextIsNonSpace && prevChar !== '' && ALNUM_RE.test(prevChar)) return null;
-  const nextChar = nextIsPunct ? after : '';
-  const prevPunct = prevChar !== '' && prevChar !== '*' && prevChar !== '_' && /[\s\p{P}\p{S}]/u.test(prevChar);
-  if (nextChar && prevChar && !prevPunct) return null;
   // whole-run context for rules 9-10
   let runStart = i;
   while (runStart > 0 && masked[runStart - 1] === ch) runStart--;
   const runPrevChar = runStart > 0 ? masked[runStart - 1] : '';
+  const effPrevChar = runStart < i ? runPrevChar : prevChar;
+  if (ch === '_' && nextIsNonSpace && effPrevChar !== '' && ALNUM_RE.test(effPrevChar)) return null;
+  const nextChar = nextIsPunct ? after : '';
+  const prevPunct = effPrevChar !== '' && effPrevChar !== '*' && effPrevChar !== '_' && /[\s\p{P}\p{S}]/u.test(effPrevChar);
+  if (nextChar && effPrevChar && !prevPunct) return null;
   const runPrevPunct = runPrevChar !== '' && /[\s\p{P}\p{S}]/u.test(runPrevChar);
   const runLength = (i - runStart) + run;
   const midRun = prevChar === ch;
@@ -484,7 +495,6 @@ function matchDel(text, masked, i, prevChar) {
   return null;
 }
 
-const DISALLOWED_TAGS = new Set(['title', 'textarea', 'style', 'xmp', 'iframe', 'noembed', 'noframes', 'script', 'plaintext']);
 
 // Main inline renderer: a single left-to-right scan.
 function parseInline(text, links, inLink) {
@@ -498,7 +508,12 @@ function parseInline(text, links, inLink) {
     const ch = text[i];
     if (ch === '\\') {
       const nx = text[i + 1];
-      if (nx === '\n') { flush(); parts.push({ html: '<br>' }); i += 2; continue; }
+      if (nx === '\n') {
+        flush(); parts.push({ html: '<br>' });
+        i += 2;
+        while (text[i] === ' ' || text[i] === '\t') i++;
+        continue;
+      }
       if (nx !== undefined && ESCAPABLE.includes(nx)) { buf += nx === '&' ? '\u0001' : nx; i += 2; continue; }
       buf += ch; i++; continue;
     }
@@ -538,11 +553,8 @@ function parseInline(text, links, inLink) {
       const tag = HTML_TAG_RE.exec(rest);
       if (tag) {
         flush();
-        const raw = tag[0];
-        const nameM = /^<\/?([A-Za-z][A-Za-z0-9-]*)/.exec(raw);
-        if (nameM && DISALLOWED_TAGS.has(nameM[1].toLowerCase())) parts.push({ html: escHtml(raw, false) });
-        else parts.push({ html: raw });
-        i += raw.length; continue;
+        parts.push({ html: tag[0] });
+        i += tag[0].length; continue;
       }
       buf += ch; i++; continue;
     }
@@ -573,13 +585,24 @@ function parseInline(text, links, inLink) {
         buf = buf.slice(0, buf.length - sp);
         flush();
         parts.push({ html: '<br>' });
-        i++; continue;
+        i++;
+        while (text[i] === ' ' || text[i] === '\t') i++;
+        continue;
       }
       buf += ch; i++; continue;
     }
     if ((ch === 'w' || ch === 'h' || ch === 'f') && (i === 0 || !isAlnumCh(text[i - 1])) && !inLink) {
       const auto = matchExtendedAutolink(text, i);
       if (auto && (auto.text.startsWith('www.') || auto.text.includes('://'))) {
+        flush();
+        parts.push({ html: '<a href="' + escHtml(cleanHref(auto.href), true) + '">' + renderTextRun(auto.text) + '</a>' });
+        i = auto.end; continue;
+      }
+    }
+    if ((ch === 'm' || ch === 'x') && !inLink && (i === 0 || !isAlnumCh(text[i - 1]))
+      && (text.startsWith('mailto:', i) || text.startsWith('xmpp:', i))) {
+      const auto = matchExtendedAutolink(text, i);
+      if (auto) {
         flush();
         parts.push({ html: '<a href="' + escHtml(cleanHref(auto.href), true) + '">' + renderTextRun(auto.text) + '</a>' });
         i = auto.end; continue;
@@ -618,14 +641,17 @@ function tryFormLink(text, openIdx, isImage, links) {
     const d = parseLinkDest(text, after);
     if (d) { href = d.href; title = d.title; end = d.end; }
   }
+  let refAttempted = false;
   if (end === -1 && text[after] === '[') {
     const close2 = findCloseBracket(text, after);
     if (close2 !== -1) {
+      refAttempted = true;
       const refLabel = text.slice(after + 1, close2);
       const def = links.get(normLabel(refLabel === '' ? labelText : refLabel));
       if (def) { href = def.href; title = def.title; end = close2 + 1; }
     }
   }
+  if (end === -1 && refAttempted) return null;
   if (end === -1) {
     const def = links.get(normLabel(labelText));
     if (!def) return null;
@@ -635,7 +661,7 @@ function tryFormLink(text, openIdx, isImage, links) {
   const hrefAttr = escHtml(cleanHref(unescapePunct(href)), true);
   if (isImage) {
     const innerHtml = parseInline(labelText, links, false);
-    const alt = innerHtml.replace(/<[^>]*>/g, '');
+    const alt = innerHtml.replace(/<img[^>]*? alt="([^"]*)"[^>]*?>/g, '$1').replace(/<[^>]*>/g, '');
     let html = '<img src="' + hrefAttr + '" alt="' + alt + '"';
     if (title !== null) html += ' title="' + escHtml(cleanTitle(title), true) + '"';
     return { html: html + '>', end };
@@ -714,7 +740,7 @@ function stripCols(line, cols) {
     else { const w = 4 - (col % 4); prefix += ' '.repeat(w); col += w; i++; }
   }
   if (prefix.length >= cols) return prefix.slice(cols) + line.slice(i);
-  return prefix + line.slice(i);
+  return line.slice(i);
 }
 
 // Expand a whitespace run to spaces, given the column the run starts at.
@@ -806,33 +832,70 @@ function readDef(lines, i) {
     s = s.slice(m[0].length);
   }
   href = unescapePunct(href);
-  // optional title, on this line or the next
-  let title = null;
-  let t = s.replace(/^[ \t]+/, '');
-  let titleLine = lineIdx;
-  if (t === '' && lineIdx + 1 < lines.length) {
-    const nxt = lines[lineIdx + 1].replace(/^[ \t]+/, '');
-    if (nxt[0] === '"' || nxt[0] === "'" || nxt[0] === '(') { t = nxt; titleLine = lineIdx + 1; }
-  }
-  if (t !== '') {
-    const q = t[0];
-    if (q === '"' || q === "'" || q === '(') {
-      const close = q === '(' ? ')' : q;
-      let k = 1, buf = '', ok = false;
-      while (k < t.length) {
-        if (t[k] === '\\' && k + 1 < t.length) { buf += t[k] + t[k + 1]; k += 2; continue; }
-        if (t[k] === close) { ok = true; break; }
-        buf += t[k]; k++;
-      }
-      if (!ok) return null;
-      title = unescapePunct(buf);
-      const tail = t.slice(k + 1);
-      if (!/^[ \t]*$/.test(tail)) return null;
-      return { label, href, title, next: titleLine + 1 };
+  // a bare destination may only hold balanced parentheses
+  {
+    let depth = 0, bad = false;
+    const rawDest = href;
+    for (let k = 0; k < rawDest.length; k++) {
+      if (rawDest[k] === '(') depth++;
+      else if (rawDest[k] === ')') { depth--; if (depth < 0) { bad = true; break; } }
     }
-    return null;
+    if (bad) return null;
   }
-  return { label, href, title, next: lineIdx + 1 };
+  // optional title: it must be separated from the destination by spaces
+  // or by the line break; a title on the next line that does not parse
+  // cleanly is simply not part of the definition
+  let title = null;
+  const afterDest = s;
+  const parseTitleFrom = (text, allowMultiline, startLine) => {
+    const q = text[0];
+    if (q !== '"' && q !== "'" && q !== '(') return null;
+    const close = q === '(' ? ')' : q;
+    let buf = '';
+    let cur = text;
+    let ln = startLine;
+    for (;;) {
+      let k = ln === startLine ? 1 : 0;
+      let closedAt = -1;
+      while (k < cur.length) {
+        if (cur[k] === '\\' && k + 1 < cur.length) { buf += cur[k] + cur[k + 1]; k += 2; continue; }
+        if (cur[k] === close) { closedAt = k; break; }
+        if (q === '(' && cur[k] === '(') return null;
+        buf += cur[k]; k++;
+      }
+      if (closedAt !== -1) {
+        return { title: unescapePunct(buf), tail: cur.slice(closedAt + 1), line: ln };
+      }
+      if (!allowMultiline) return null;
+      ln++;
+      if (ln >= lines.length || isBlankLine(lines[ln])) return null;
+      buf += '\n';
+      cur = lines[ln];
+    }
+  };
+  if (/^[ \t]*$/.test(afterDest)) {
+    // maybe a title on the next line
+    if (lineIdx + 1 < lines.length) {
+      const nxt = lines[lineIdx + 1];
+      const lead = /^[ \t]*/.exec(nxt)[0].length;
+      const t = parseTitleFrom(nxt.slice(lead), true, lineIdx + 1);
+      if (t && /^[ \t]*$/.test(t.tail)) {
+        return { label, href, title: t.title, next: t.line + 1 };
+      }
+    }
+    return { label, href, title, next: lineIdx + 1 };
+  }
+  if (/^[ \t]/.test(afterDest)) {
+    const t = parseTitleFrom(afterDest.replace(/^[ \t]+/, ''), true, lineIdx);
+    if (!t) return null;
+    if (!/^[ \t]*$/.test(t.tail)) {
+      // junk after a same-line title: the whole definition fails, unless
+      // the title actually started on the next line (handled above)
+      return null;
+    }
+    return { label, href, title: t.title, next: t.line + 1 };
+  }
+  return null;
 }
 function findLabelEnd(s) {
   let depth = 0;
@@ -844,7 +907,7 @@ function findLabelEnd(s) {
   return -1;
 }
 
-const FENCE_RE = /^ {0,3}(`{3,}|~{3,})([^`~]*)$/;
+const FENCE_RE = /^ {0,3}(?:(`{3,})([^`]*)|(~{3,})(.*))$/;
 const ATX_RE = /^ {0,3}(#{1,6})(?:[ \t]+|$)(.*)$/;
 const HR_RE = /^ {0,3}((?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})[ \t]*$/;
 const QUOTE_RE = /^ {0,3}>[ \t]?/;
@@ -895,7 +958,7 @@ function htmlBlockStart(line) {
   if (/^ {0,3}<![A-Za-z]/.test(line)) return 4;
   if (/^ {0,3}<!\[CDATA\[/.test(line)) return 5;
   if (HTML_BLOCK_TAGS_RE.test(line)) return 6;
-  if (/^ {0,3}<\/?[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \t]*=[ \t]*(?:[^ \t"'=<>`]+|'[^']*'|"[^"]*"))?)*[ \t]*\/?>[ \t]*$/.test(line)) return 7;
+  if (/^ {0,3}<[A-Za-z][A-Za-z0-9-]*(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \t]*=[ \t]*(?:[^ \t"'=<>`]+|'[^']*'|"[^"]*"))?)*[ \t]*\/?>[ \t]*$/.test(line)) return 7;
   if (/^ {0,3}<\/[A-Za-z][A-Za-z0-9-]*[ \t]*>[ \t]*$/.test(line)) return 7;
   return 0;
 }
@@ -923,7 +986,7 @@ function splitRow(line) {
     cur += ch; i++;
   }
   cells.push(cur);
-  return cells.map((c) => c.trim());
+  return cells.map((c) => c.trim().replace(/\\\|/g, '|'));
 }
 
 function parseTable(lines, i, links) {
@@ -945,7 +1008,7 @@ function parseTable(lines, i, links) {
   }
   const rows = [];
   let j = i + 2;
-  while (j < lines.length && !isBlankLine(lines[j]) && lines[j].includes('|')) {
+  while (j < lines.length && !isBlankLine(lines[j]) && !startsBlock(lines[j], true)) {
     rows.push(splitRow(lines[j]));
     j++;
   }
@@ -957,7 +1020,9 @@ function renderTable(nd, links) {
   nd.header.forEach((c, k) => {
     html += '<th' + (nd.aligns[k] ? ' align="' + nd.aligns[k] + '"' : '') + '>' + parseInline(c, links, false) + '</th>\n';
   });
-  html += '</tr>\n</thead>\n<tbody>';
+  html += '</tr>\n</thead>\n';
+  if (nd.rows.length === 0) return html + '</table>\n';
+  html += '<tbody>';
   for (const row of nd.rows) {
     html += '<tr>\n';
     for (let k = 0; k < nd.header.length; k++) {
@@ -979,6 +1044,7 @@ function parseList(lines, i, links) {
   const startNum = ordered ? parseInt(firstMarker, 10) : 1;
   const items = []; // { lines: string[], blankAfter: boolean }
   let j = i;
+  let lastItemEnd = i;
   while (j < lines.length) {
     if (HR_RE.test(lines[j])) break;
     const m = LIST_RE.exec(lines[j]);
@@ -1022,10 +1088,12 @@ function parseList(lines, i, links) {
       // empty item: consume the one blank line and finish
       items.push({ lines: [], blankAfter: true });
       j += 2;
+      lastItemEnd = j;
       continue;
     }
     itemLines.push(firstContent);
     j++;
+    let itemEnd = j;
     let sawBlank = false;
     let pendingBlanks = 0;
     let lastLine = firstContent;
@@ -1051,6 +1119,7 @@ function parseList(lines, i, links) {
         itemLines.push(stripped);
         lastLine = stripped;
         j++;
+        itemEnd = j;
         continue;
       }
       if (pendingBlanks > 0) break;
@@ -1064,30 +1133,27 @@ function parseList(lines, i, links) {
         itemLines.push('    ' + l.trim());
         lastLine = l;
         j++;
+        itemEnd = j;
         continue;
       }
       itemLines.push(l);
       lastLine = l;
       j++;
+      itemEnd = j;
     }
     // trim trailing blank lines of the item
     while (itemLines.length && itemLines[itemLines.length - 1] === '') itemLines.pop();
-    items.push({ lines: itemLines, blankAfter: sawBlank });
+    items.push({ lines: itemLines, blankAfter: pendingBlanks > 0 });
+    lastItemEnd = itemEnd;
     if (j >= lines.length) break;
     if (!LIST_RE.test(lines[j])) break;
   }
   if (items.length === 0) return null;
   const sepLoose = items.slice(0, -1).some((it) => it.blankAfter);
-  return { node: { kind: 'list', ordered, startNum, sepLoose, items: items.map((it) => it.lines) }, next: j };
-}
-
-// Render a list node once the full definition table is known.
-function renderList(nd, links) {
-  const tag = nd.ordered ? 'ol' : 'ul';
-  const parsed = nd.items.map((itemLines) => {
-    const nodes = parseBlocks(itemLines.join('\n'), links, true);
+  const parsedItems = items.map((it) => {
+    const nodes = parseBlocks(it.lines.join('\n'), links, true);
     let checkbox = '';
-    const firstText = itemLines.length ? itemLines[0] : '';
+    const firstText = it.lines.length ? it.lines[0] : '';
     const taskM = /^\[([ xX])\][ \t]+\S/.exec(firstText);
     if (taskM && nodes.length && nodes[0].kind === 'para') {
       checkbox = taskM[1] === ' '
@@ -1097,15 +1163,21 @@ function renderList(nd, links) {
     }
     return { nodes, checkbox };
   });
-  const loose = nd.sepLoose || parsed.some((p) => p.nodes.hasSpacer);
+  const loose = sepLoose || parsedItems.some((pi) => pi.nodes.hasSpacer);
+  return { node: { kind: 'list', ordered, startNum, loose, items: parsedItems }, next: lastItemEnd };
+}
+
+// Render a list node whose items were parsed when the list was read.
+function renderList(nd, links) {
+  const tag = nd.ordered ? 'ol' : 'ul';
   let html = '<' + tag + (nd.ordered && nd.startNum !== 1 ? ' start="' + nd.startNum + '"' : '') + '>\n';
-  for (const { nodes, checkbox } of parsed) {
-    if (loose && checkbox && nodes.length && nodes[0].kind === 'para') {
+  for (const { nodes, checkbox } of nd.items) {
+    if (nd.loose && checkbox && nodes.length && nodes[0].kind === 'para') {
       // in a loose list the checkbox lives inside the first paragraph
       const first = '<p>' + checkbox + parseInline(nodes[0].text, links, false) + '</p>\n';
       html += '<li>' + first + renderBlocks(nodes.slice(1), false, links) + '</li>\n';
     } else {
-      html += '<li>' + checkbox + renderBlocks(nodes, !loose, links) + '</li>\n';
+      html += '<li>' + checkbox + renderBlocks(nodes, !nd.loose, links) + '</li>\n';
     }
   }
   html += '</' + tag + '>\n';
@@ -1120,13 +1192,23 @@ function quoteChunkIsBlocky(inner) {
     if (l === '') continue;
     if (FENCE_RE.test(l) || ATX_RE.test(l) || HR_RE.test(l)) return true;
     if (htmlBlockStart(l) >= 1) return true;
-    if (leadingIndent(l).cols >= 4) return true;
+    if (leadingIndent(l).cols >= 4) {
+      // an indented run is a real code block unless it directly
+      // continues a paragraph line, in which case it is merged text
+      let m = k;
+      while (m >= 0 && leadingIndent(inner[m]).cols >= 4) m--;
+      if (m < 0 || inner[m] === '') return true;
+      const before = inner[m];
+      if (FENCE_RE.test(before) || ATX_RE.test(before) || HR_RE.test(before)) return true;
+      if (htmlBlockStart(before) >= 1) return true;
+      return false;
+    }
     return false;
   }
   return false;
 }
 
-function parseBlocks(src, links, inItem = false) {
+function parseBlocks(src, links, inItem = false, lazyMap = null) {
   const lines = toLines(src);
   const nodes = [];
   nodes.hasSpacer = false;
@@ -1150,16 +1232,16 @@ function parseBlocks(src, links, inItem = false) {
     }
     // fenced code
     const fm = FENCE_RE.exec(line);
-    if (fm && !(fm[1][0] === '`' && fm[2].includes('`'))) {
-      const marker = fm[1];
-      const info = fm[2].trim();
+    if (fm) {
+      const marker = fm[1] || fm[3];
+      const info = (fm[1] ? fm[2] : fm[4]).trim();
+      const fenceIndent = leadingIndent(line).cols;
       const closeRe = fenceCloseRe(marker);
       const body = [];
       let j = i + 1;
-      while (j < lines.length && !closeRe.test(lines[j])) { body.push(lines[j]); j++; }
+      while (j < lines.length && !closeRe.test(lines[j])) { body.push(stripCols(lines[j], fenceIndent)); j++; }
       if (j < lines.length) j++;
       let content = body.join('\n');
-      if (body.length) content += '\n';
       content = content ? content.replace(/\n$/, '') + '\n' : '';
       const lang = info ? unescapePunct(info.split(/\s+/)[0]) : '';
       const cls = lang ? ' class="language-' + escHtml(lang, true) + '"' : '';
@@ -1182,7 +1264,10 @@ function parseBlocks(src, links, inItem = false) {
     // block quote
     if (QUOTE_RE.test(line)) {
       const inner = [];
+      const lazy = [];
       let j = i;
+      let chunkLen = 0;
+      let chunkHasMarker = false;
       while (j < lines.length) {
         const l = lines[j];
         const qm = /^ {0,3}>/.exec(l);
@@ -1191,17 +1276,41 @@ function parseBlocks(src, links, inItem = false) {
           const wsM = /^[ \t]*/.exec(afterM);
           const expanded = expandWs(wsM[0], qm[0].length);
           inner.push((expanded.startsWith(' ') ? expanded.slice(1) : expanded) + afterM.slice(wsM[0].length));
+          lazy.push(false);
+          chunkLen++;
+          chunkHasMarker = true;
           j++; continue;
         }
         if (isBlankLine(l)) break;
         // lazy continuation; an '=' underline is kept as paragraph text,
         // but lazy lines stop at block starts and after a chunk whose
         // last block is code, a heading, a rule, an HTML block or a table
-        if (inner.length && inner[inner.length - 1] !== '' && /^ {0,3}=+[ \t]*$/.test(l)) { inner.push('    ' + l.trim()); j++; continue; }
-        if (inner.length && inner[inner.length - 1] !== '' && !startsBlock(l, true) && !quoteChunkIsBlocky(inner)) { inner.push(l); j++; continue; }
+        if (inner.length && inner[inner.length - 1] !== '') {
+          // a lazy line starts a new chunk once the current chunk
+          // holds a marker line
+          const chunkFirst = chunkHasMarker;
+          if (/^ {0,3}=+[ \t]*$/.test(l)) {
+            inner.push('    ' + l.trim());
+            // an underline inside a chunk is defused with four spaces
+            // that survive; at a chunk start the same prefix is later
+            // removed again by the paragraph's lazy-line handling
+            lazy.push(chunkFirst ? true : 'setext');
+            chunkLen = chunkFirst ? 1 : chunkLen + 1;
+            chunkHasMarker = false;
+            j++; continue;
+          }
+          if (!startsBlock(l, true) && !quoteChunkIsBlocky(inner)) {
+            inner.push(l);
+            lazy.push(true);
+            chunkLen = chunkFirst ? 1 : chunkLen + 1;
+            if (chunkFirst) chunkHasMarker = false;
+            j++; continue;
+          }
+        }
         break;
       }
-      nodes.push({ kind: 'quote', src: inner.join('\n'), inItem });
+      nodes.push({ kind: 'quote', children: parseBlocks(inner.join('\n'), links, inItem, lazy) });
+
       i = j; continue;
     }
     // table (needs a delimiter on the next line)
@@ -1253,11 +1362,11 @@ function parseBlocks(src, links, inItem = false) {
       let j = i;
       while (j < lines.length) {
         const l = lines[j];
-        if (isBlankLine(l)) { body.push(''); j++; continue; }
+        if (isBlankLine(l)) { body.push(stripCols(l, 4)); j++; continue; }
         if (leadingIndent(l).cols >= 4) { body.push(stripCols(l, 4)); j++; continue; }
         break;
       }
-      while (body.length && body[body.length - 1] === '') body.pop();
+      while (body.length && isBlankLine(body[body.length - 1])) body.pop();
       let content = body.join('\n');
       if (body.length) content += '\n';
       content = content ? content.replace(/\n$/, '') + '\n' : '';
@@ -1268,13 +1377,22 @@ function parseBlocks(src, links, inItem = false) {
     const paraLines = [line];
     let j = i + 1;
     let setextDepth = 0;
+    let lazyStrip = false;
     while (j < lines.length) {
       const l = lines[j];
       if (isBlankLine(l)) {
         if (l.length > 0 && j === lines.length - 1 && !src.endsWith('\n')) { paraLines.push(l); j++; }
         break;
       }
-      if (inItem && leadingIndent(l).cols >= 4 && !startsBlock(l, true)) { paraLines.push(stripCols(l, 4)); j++; continue; }
+      if (lazyMap && lazyMap[j] === 'setext') { paraLines.push(l); j++; continue; }
+      if (lazyMap && lazyMap[j]) {
+        // a lazy quote line that is indented like a code block has up
+        // to four columns removed, as an indented block cannot
+        // interrupt a paragraph; the removal continues over the run of
+        // indented lazy lines and stops at the first outdented one
+        if (leadingIndent(l).cols >= 4) { lazyStrip = true; paraLines.push(stripCols(l, 4)); j++; continue; }
+        lazyStrip = false;
+      } else if (inItem && leadingIndent(l).cols >= 4 && !startsBlock(l, true)) { paraLines.push(stripCols(l, 4)); j++; continue; }
       const sm = SETEXT_RE.exec(l);
       if (sm && paraLines.length >= 1) { setextDepth = sm[1][0] === '=' ? 1 : 2; j++; break; }
       if (startsBlock(l, true)) break;
@@ -1295,7 +1413,7 @@ function renderBlocks(nodes, tight, links) {
   let out = '';
   nodes.forEach((nd, idx) => {
     const isLast = idx === nodes.length - 1;
-    if (nd.kind === 'quote') out += '<blockquote>\n' + renderBlocks(parseBlocks(nd.src, links, nd.inItem), false, links) + '</blockquote>\n';
+    if (nd.kind === 'quote') out += '<blockquote>\n' + renderBlocks(nd.children, false, links) + '</blockquote>\n';
     else if (nd.kind === 'list') out += renderList(nd, links);
     else if (nd.kind === 'table') out += renderTable(nd, links);
     else if (nd.kind === 'htmlblock') out += nd.raw + nd.tail;
