@@ -459,7 +459,7 @@ function scanList(src, ctx) {
       const htmlRe = new RegExp('^ {0,' + beginPad + '}(?:<\\/?(?:' + BLOCK_TAGS + ')(?: +|$|\\/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)', 'i');
       const quoteRe = new RegExp('^ {0,' + beginPad + '}>');
       let wasBlank = blankFirst;
-      let lastLine = expanded;
+      let prevLine = expanded;
       while (rest) {
         const line = rest.split('\n', 1)[0];
         const tabbed = line.replace(/^[ \t]+/, (ws) => expandTabs(ws));
@@ -467,19 +467,19 @@ function scanList(src, ctx) {
         if (tabbed.search(/\S/) >= indent || !line.trim()) {
           content += '\n' + tabbed.slice(indent);
         } else {
-          // Lazy continuation: only while the item so far is a plain
-          // paragraph (not code/fence/heading/html/quote) — approximated
-          // exactly as the reference: it stops when the first line already
-          // starts one of those constructs.
-          if (wasBlank || expanded.replace(/\t/g, '    ').search(/\S/) >= 4 || fenceRe.test(expanded) || headingRe.test(expanded) || htmlRe.test(expanded) || hrRe.test(expanded)) break;
-          const setextHack = /^ {0,3}(?:=+|-+) *$/.test(line) && reSetext.test(expanded + '\n' + line)
+          // Lazy continuation: allowed only while the previous line is a
+          // plain paragraph line — it stops when the previous line is
+          // blank, is indented code, or starts a fence, heading, HTML
+          // block or thematic break.
+          if (wasBlank || prevLine.replace(/\t/g, '    ').search(/\S/) >= 4 || fenceRe.test(prevLine) || headingRe.test(prevLine) || htmlRe.test(prevLine) || hrRe.test(prevLine)) break;
+          const setextHack = /^ {0,3}(?:=+|-+) *$/.test(line) && reSetext.test(prevLine + '\n' + line)
             ? '    ' + tabbed.replace(/^ {0,3}/, '')
             : line;
           content += '\n' + setextHack;
         }
         wasBlank = !line.trim();
         rest = rest.substring(line.length + 1);
-        lastLine = tabbed.slice(indent);
+        prevLine = tabbed.slice(indent);
       }
     }
     const itemRaw = src.slice(itemStart, src.length - rest.length);
