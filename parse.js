@@ -185,15 +185,18 @@ const INTERRUPT =
   '|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)' +
   '|<\\?|<![A-Za-z]|<!\\[CDATA\\[)' +
   '|[ \\t]+\\n';
-const reParagraph = new RegExp('^([^\\n]+(?:\\n(?!' + INTERRUPT + ')[^\\n]+)*)');
+// reParagraph is built after reTable below: a paragraph line also ends
+// when a complete table starts at that line.
 // Setext heading: text lines (none starting another block construct, no
 // blank line inside) followed by an = or - underline. The GFM variant also
 // refuses table-delimiter lines as first line, content lines and
 // interrupting lines.
 const SETEXT_STOP =
   ' {0,3}(?:[*+-]|\\d{1,9}[.)]) |(?: {4}| {0,3}\\t)| {0,3}(?:`{3,}|~{3,})| {0,3}>| {0,3}#{1,6}(?:\\s|$)| {0,3}<[^\\n>]+>\\n| {0,3}\\|?(?:[:\\- ]*\\|)+[:\\- ]*\\n';
+const SETEXT_CONT =
+  ' {0,3}(?:[*+-]|\\d{1,9}[.)]) | {0,3}(?:`{3,}|~{3,})| {0,3}>| {0,3}#{1,6}(?:\\s|$)| {0,3}<[^\\n>]+>\\n| {0,3}\\|?(?:[:\\- ]*\\|)+[:\\- ]*\\n';
 const reSetext = new RegExp(
-  '^(?!' + SETEXT_STOP + ')((?:.|\\n(?!\\s*?\\n|' + SETEXT_STOP +
+  '^(?!' + SETEXT_STOP + ')((?:.|\\n(?!\\s*?\\n|' + SETEXT_CONT +
   '| {0,3}(?:(?:-[\\t ]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})(?:\\n+|$)' +
   '| {0,3}<[^\\n>]+>\\n| {0,3}\\|?(?:[:\\- ]*\\|)+[:\\- ]*\\n))+?)\\n {0,3}(=+|-+)[ \\t]*(?:\\n+|$)');
 const TABLE_STOP =
@@ -209,6 +212,7 @@ const TABLE_STOP =
 const reTable = new RegExp(
   '^ *([^\\n ].*)\\n {0,3}((?:\\| *)?:?-+:? *(?:\\| *:?-+:? *)*(?:\\| *)?)' +
   '(?:\\n((?:(?! *\\n|' + TABLE_STOP + ').*?(?:\\n|$))*)\\n*|$)');
+const reParagraph = new RegExp('^([^\\n]+(?:\\n(?!' + INTERRUPT + '|' + reTable.source.slice(1) + ')[^\\n]+)*)');
 const reTextLine = /^[^\n]+/;
 
 // A blockquote is a run of lines each starting with ">"; a non-blank line
