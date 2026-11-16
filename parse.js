@@ -168,7 +168,7 @@ const reHtmlBlock = new RegExp(
   '|<(?!(?:script|pre|style|textarea)(?![a-z0-9-]))([a-z][a-z0-9-]*)(?: +[a-zA-Z:_][\\w.:-]*(?: *= *"[^"\\n]*"| *= *\'[^\'\\n]*\'| *= *[^\\s"\'=<>`]+)?)*? *\\/?>(?=[ \\t]*(?:\\n|$))[\\s\\S]*?(?:(?:\\n[ \\t]*)+\\n|$)' +
   '|<\\/[a-z][a-z0-9-]*\\s*>(?=[ \\t]*(?:\\n|$))[\\s\\S]*?(?:(?:\\n[ \\t]*)+\\n|$)' +
   ')', 'i');
-const reDefLabel = /(?:(?!\s*\])(?:\\[\s\S]|[^\[\]\\\n]|\n(?![ \t]*\n)))+/;
+const reDefLabel = /(?!\s*\])(?:\\[\s\S]|[^\[\]\\\n]|\n(?![ \t]*\n))+/;
 const reDefTitle = /(?:\"(?:\\[\s\S]|[^\"\\])*\"|'(?:\\[\s\S]|[^'\\\n]|\n(?!\n))*'|\((?:\\[\s\S]|[^()\\])*\))/;
 const reDef = new RegExp('^ {0,3}\\[(' + reDefLabel.source + ')\\]: *(?:\\n[ \\t]*)?([^<\\s][^\\s]*|<.*?>)(?:(?: +(?:\\n[ \\t]*)?| *\\n[ \\t]*)(' + reDefTitle.source + '))? *(?:\\n+|$)');
 // What can interrupt a paragraph: a thematic break, ATX heading,
@@ -196,10 +196,19 @@ const reSetext = new RegExp(
   '^(?!' + SETEXT_STOP + ')((?:.|\\n(?!\\s*?\\n|' + SETEXT_STOP +
   '| {0,3}(?:(?:-[\\t ]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})(?:\\n+|$)' +
   '| {0,3}<[^\\n>]+>\\n| {0,3}\\|?(?:[:\\- ]*\\|)+[:\\- ]*\\n))+?)\\n {0,3}(=+|-+)[ \\t]*(?:\\n+|$)');
-const TABLE_STOP = INTERRUPT.replace(' {0,3}(?:[*+-]|1[.)])[ \\t]+[^ \\t\\n]', ' {0,3}(?:[*+-]|1[.)])[ \\t]');
+const TABLE_STOP =
+  ' {0,3}((?:-[\\t ]*){3,}|(?:_[ \\t]*){3,}|(?:\\*[ \\t]*){3,})(?:\\n+|$)' +
+  '| {0,3}#{1,6}(?:\\s|$)' +
+  '| {0,3}>' +
+  '|(?: {4}| {0,3}\\t)[^\\n]' +
+  '| {0,3}(?:`{3,}(?=[^`\\n]*(?:\\n|$))|~~~)[^\\n]*(?:\\n|$)' +
+  '| {0,3}(?:[*+-]|1[.)])[ \\t]' +
+  '| {0,3}(?:<\\/?(?:' + BLOCK_TAGS + ')(?: +|\\n|\\/?>)' +
+  '|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)' +
+  '|<\\?|<![A-Za-z]|<!\\[CDATA\\[)';
 const reTable = new RegExp(
   '^ *([^\\n ].*)\\n {0,3}((?:\\| *)?:?-+:? *(?:\\| *:?-+:? *)*(?:\\| *)?)' +
-  '(?:\\n((?:(?! *\\n|' + TABLE_STOP + ')[^\\n]+)*))?');
+  '(?:\\n((?:(?! *\\n|' + TABLE_STOP + ').*?(?:\\n|$))*)\\n*|$)');
 const reTextLine = /^[^\n]+/;
 
 // A blockquote is a run of lines each starting with ">"; a non-blank line
@@ -382,7 +391,11 @@ function scanQuote(src, ctx) {
       lines = lines.slice(extra);
       continue;
     }
-    break;
+    // Any other ending token: the next chunk's blocks are lexed into the
+    // same token list, where a paragraph (or indented code / definition)
+    // merges with the previous one — that is how lazy lines join the
+    // quote's running paragraph.
+    continue;
   }
   return { kind: 'blockquote', raw: rawAll, text: textAll, tokens: inner };
 }
@@ -438,12 +451,13 @@ function scanList(src, ctx) {
       itemDone = true;
     }
     if (!itemDone) {
-      const nextBulletRe = new RegExp('^ {0,' + indent + '}(?:[*+-]|\\d{1,9}[.)])((?:[ \t][^\\n]*)?(?:\\n|$))');
-      const hrRe = new RegExp('^ {0,' + indent + '}((?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\\*[ \t]*){3,})(?:\\n+|$)');
-      const fenceRe = new RegExp('^ {0,' + indent + '}(?:```|~~~)');
-      const headingRe = new RegExp('^ {0,' + indent + '}#{1,6}(?:\\s|$)');
-      const htmlRe = new RegExp('^ {0,' + indent + '}(?:<\\/?(?:' + BLOCK_TAGS + ')(?: +|$|\\/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)', 'i');
-      const quoteRe = new RegExp('^ {0,' + indent + '}>');
+      const beginPad = Math.min(indent - 1, 3);
+      const nextBulletRe = new RegExp('^ {0,' + beginPad + '}(?:[*+-]|\\d{1,9}[.)])((?:[ \t][^\\n]*)?(?:\\n|$))');
+      const hrRe = new RegExp('^ {0,' + beginPad + '}((?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\\*[ \t]*){3,})(?:\\n+|$)');
+      const fenceRe = new RegExp('^ {0,' + beginPad + '}(?:```|~~~)');
+      const headingRe = new RegExp('^ {0,' + beginPad + '}#{1,6}(?:\\s|$)');
+      const htmlRe = new RegExp('^ {0,' + beginPad + '}(?:<\\/?(?:' + BLOCK_TAGS + ')(?: +|$|\\/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)', 'i');
+      const quoteRe = new RegExp('^ {0,' + beginPad + '}>');
       let wasBlank = blankFirst;
       let lastLine = expanded;
       while (rest) {
@@ -500,12 +514,8 @@ function scanList(src, ctx) {
       if (cb) {
         const box = { kind: 'checkbox', raw: cb[0] + ' ', checked: cb[0] !== '[ ]' };
         item.checked = box.checked;
-        if (list.loose) {
-          if (head.tokens) { head.raw = box.raw + head.raw; head.text = box.raw + head.text; head.tokens.unshift(box); }
-          else item.tokens.unshift({ kind: 'paragraph', raw: box.raw, text: box.raw, tokens: [box] });
-        } else {
-          item.tokens.unshift(box);
-        }
+        if (list.loose) head.leadBox = box;
+        else item.tokens.unshift(box);
       }
     } else if (item.task) {
       item.task = false;
@@ -618,13 +628,13 @@ const reRefLabel = /((?!\s*\])(?:\\[\s\S]|[^\[\]\\\n]|\n(?![ \t]*\n))+)/;
 const reReflink = new RegExp('^!?\\[' + reLinkLabel.source + '\\]\\[' + reRefLabel.source + '\\]');
 const reNolink = new RegExp('^!?\\[' + reRefLabel.source + '\\](?:\\[\\])?');
 const reRefSearch = /!?\[((?:[^\[\]\\`]*(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\]))){0,999}?[^\[\]\\`]*?)\]\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999})\]|!?\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999})\](?:\[\])?(?!\()/g;
-const reBlockSkip = /\[(?:[^\[\]`]|(`+)[^`]+\1(?!`))*?\]\((?:\\[\s\S]|[^\\()]|\((?:\\[\s\S]|[^\\()])*\))*\)|(?<!`)()(`+)[^`]+\2(?!`)|<(?! )[^<>]*?>/g;
+const reBlockSkip = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\()]|\((?:\\[\s\S]|[^\\()])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
 const reAnyPunctOutsideCode = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
 const reEmLDelim = /^(?:\*+(?:((?!\*)(?!~)[\p{P}\p{S}])|([^\s*]))?)|^_+(?:((?!_)(?!~)[\p{P}\p{S}])|([^\s_]))?/u;
 const reDelLDelim = /^~~?(?:((?!~)[\p{P}\p{S}])|[^\s~])/u;
 const reDelRDelim = /^[^~]+(?=[^~])|(?!~)[\p{P}\p{S}](~~?)(?=[\s]|$)|[^\s\p{P}\p{S}](~~?)(?!~)(?=[\s\p{P}\p{S}]|$)|(?!~)[\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])|[\s](~~?)(?!~)(?=[\p{P}\p{S}])|(?!~)[\p{P}\p{S}](~~?)(?!~)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])/gu;
 const reEmRDelimAst = /^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?=[\s]|$)|(?:[^\s\p{P}\p{S}]|~)(\*+)(?!\*)(?=(?!~)[\s\p{P}\p{S}]|$)|(?!\*)(?!~)[\s\p{P}\p{S}](\*+)(?=(?:[^\s\p{P}\p{S}]|~))|[\s](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?:[^\s\p{P}\p{S}]|~)(\*+)(?=(?:[^\s\p{P}\p{S}]|~))/gu;
-const reEmRDelimUnd = /^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)|[^_]+(?=[^_])|(?!_)[\p{P}\p{S}](_+)(?=[\s]|$)|[^\s\p{P}\p{S}](_+)(?!_)(?=[\s\p{P}\p{S}]|$)|(?!_)[\s\p{P}\p{S}](_+)(?=[^\s\p{P}\p{S}])|[\s](_+)(?!_)(?=[\p{P}\p{S}])|(?!_)[\p{P}\p{S}](_+)(?!_)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](_+)(?=[^\s\p{P}\p{S}])/gu;
+const reEmRDelimUnd = /^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)|[^_]+(?=[^_])|(?!_)[\p{P}\p{S}](_+)(?=[\s]|$)|[^\s\p{P}\p{S}](_+)(?!_)(?=[\s\p{P}\p{S}]|$)|(?!_)[\s\p{P}\p{S}](_+)(?=[^\s\p{P}\p{S}])|[\s](_+)(?!_)(?=[\p{P}\p{S}])|(?!_)[\p{P}\p{S}](_+)(?!_)(?=[\p{P}\p{S}])/gu;
 const rePunctuation = /^((?![*_])[\s\p{P}\p{S}])/u;
 const reUrl = /^(?:mailto:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])|xmpp:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])(?:\/[A-Za-z0-9@.]+)?)|^((?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.)(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*|^[A-Za-z0-9._+-]+(@)[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/;
 const reBackpedal = /(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
@@ -1125,10 +1135,10 @@ function renderBlocks(tokens, ctx) {
         out += '<blockquote>\n' + renderBlocks(t.tokens, ctx) + '</blockquote>\n';
         break;
       case 'paragraph':
-        out += '<p>' + renderInline(parseInline(t.text, ctx), ctx) + '</p>\n';
+        out += '<p>' + (t.leadBox ? renderBlocks([t.leadBox], ctx) : '') + renderInline(parseInline(t.text, ctx), ctx) + '</p>\n';
         break;
       case 'text':
-        out += renderInline(parseInline(t.text, ctx), ctx);
+        out += (t.leadBox ? renderBlocks([t.leadBox], ctx) : '') + renderInline(parseInline(t.text, ctx), ctx);
         break;
       case 'checkbox':
         out += '<input ' + (t.checked ? 'checked="" ' : '') + 'disabled="" type="checkbox"> ';
