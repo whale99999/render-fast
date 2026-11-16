@@ -1,37 +1,33 @@
-// Entry point for the render-fast submission.
+// Harness driver for render-fast.
 //
-// What the harness hands us: a directory (MAKEFUN_INPUT_DIR, or /input
-// by default) containing cases.json — an array of { id, markdown }
-// objects. What it expects back: html.json in the output directory
-// (MAKEFUN_OUTPUT_DIR, or /output), a JSON array holding the rendered
-// HTML for each case in the original order.
-//
-// Every case is rendered by a separate parse() call, exactly as if it
-// were the only document in the world: nothing is carried over from
-// one case to the next.
+// Reads the case set from the input directory, renders every case on its
+// own with parse() (no state is carried between cases), and writes the
+// resulting HTML strings, in order, as a JSON array to the output
+// directory. Directory locations come from the MAKEFUN_INPUT_DIR /
+// MAKEFUN_OUTPUT_DIR environment variables, defaulting to /input and
+// /output.
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { parse } from './parse.js';
 
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { parse } from "./parse.js";
+type Case = { id: string; markdown: string };
 
-interface InputCase {
-  id: string;
-  markdown: string;
-}
-
-function envDir(name: string, fallback: string): string {
+function dirFromEnv(name: string, fallback: string): string {
   const value = process.env[name];
-  return value === undefined || value === "" ? fallback : value;
+  return value === undefined || value === '' ? fallback : value;
 }
 
-const casesPath = join(envDir("MAKEFUN_INPUT_DIR", "/input"), "cases.json");
-const outPath = join(envDir("MAKEFUN_OUTPUT_DIR", "/output"), "html.json");
-
-const inputCases = JSON.parse(readFileSync(casesPath, "utf8")) as InputCase[];
-
-const html: string[] = [];
-for (const inputCase of inputCases) {
-  html.push(parse(inputCase.markdown));
+function main(): void {
+  const inputDir = dirFromEnv('MAKEFUN_INPUT_DIR', '/input');
+  const outputDir = dirFromEnv('MAKEFUN_OUTPUT_DIR', '/output');
+  const raw = readFileSync(join(inputDir, 'cases.json'), 'utf8');
+  const cases = JSON.parse(raw) as Case[];
+  const html: string[] = new Array(cases.length);
+  for (let i = 0; i < cases.length; i++) {
+    html[i] = parse(cases[i].markdown);
+  }
+  mkdirSync(outputDir, { recursive: true });
+  writeFileSync(join(outputDir, 'html.json'), JSON.stringify(html));
 }
 
-writeFileSync(outPath, JSON.stringify(html));
+main();
