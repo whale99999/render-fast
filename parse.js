@@ -849,7 +849,7 @@ function scanEmStrong(src, masked, prevChar, ctx) {
   let prevMaskedChar = prevChar;
   if (runStart < offset) prevMaskedChar = beforeRun;
   const prevIsPunct = runStart < offset ? beforeIsPunct : !!rePunctuation.exec(prevChar);
-  const sameChar = prevMaskedChar === delim;
+  const sameChar = prevChar === delim;
   if (lm[4] && /[\p{L}\p{N}]/u.test(prevMaskedChar)) return null;
   const leftRun = lm[1] || lm[3] || '';
   if (!leftRun || !prevMaskedChar || prevIsPunct) {
