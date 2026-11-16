@@ -17,15 +17,23 @@ function dirFromEnv(name: string, fallback: string): string {
   return value === undefined || value === '' ? fallback : value;
 }
 
+// Render every case independently and collect the HTML strings in input
+// order. parse() keeps no state between calls, so each case is rendered
+// exactly as if it were the only one.
+function renderAll(cases: Case[]): string[] {
+  const html: string[] = new Array(cases.length);
+  for (let i = 0; i < cases.length; i++) {
+    html[i] = parse(cases[i].markdown);
+  }
+  return html;
+}
+
 function main(): void {
   const inputDir = dirFromEnv('MAKEFUN_INPUT_DIR', '/input');
   const outputDir = dirFromEnv('MAKEFUN_OUTPUT_DIR', '/output');
   const raw = readFileSync(join(inputDir, 'cases.json'), 'utf8');
   const cases = JSON.parse(raw) as Case[];
-  const html: string[] = new Array(cases.length);
-  for (let i = 0; i < cases.length; i++) {
-    html[i] = parse(cases[i].markdown);
-  }
+  const html = renderAll(cases);
   mkdirSync(outputDir, { recursive: true });
   writeFileSync(join(outputDir, 'html.json'), JSON.stringify(html));
 }

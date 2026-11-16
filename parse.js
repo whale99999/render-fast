@@ -299,6 +299,13 @@ const reAlignRight = /^ *-+: *$/;
 const reAlignCenter = /^ *:-+: *$/;
 const reAlignLeft = /^ *:-+ *$/;
 function scanTable(src, ctx) {
+  // Cheap gate: the second line must look like a delimiter row (only
+  // pipes, colons, dashes and spaces, with at least one dash).
+  const nl = src.indexOf('\n');
+  if (nl < 0) return null;
+  const nl2 = src.indexOf('\n', nl + 1);
+  const line2 = nl2 < 0 ? src.slice(nl + 1) : src.slice(nl + 1, nl2);
+  if (!/^ {0,3}[|:\- ]*$/.test(line2) || !line2.includes('-')) return null;
   const m = reTable.exec(src);
   if (!m || !/[:|]/.test(m[2])) return null;
   const headerCells = splitRow(m[1]);
@@ -314,7 +321,23 @@ function scanTable(src, ctx) {
   return { kind: 'table', raw: trimEndChar(m[0], '\n'), header, rows, align };
 }
 
+const reUnderlineLine = /^ {0,3}(=+|-+)[ \t]*$/;
 function scanSetext(src) {
+  // Cheap gate: some line after the first, before any blank line, must be
+  // a setext underline. If the first such candidate cannot complete the
+  // match, no later one can either (the same offending line would be part
+  // of its content), so one full attempt is enough.
+  let pos = src.indexOf('\n');
+  if (pos < 0) return null;
+  let found = false;
+  while (pos >= 0) {
+    const next = src.indexOf('\n', pos + 1);
+    const line = next < 0 ? src.slice(pos + 1) : src.slice(pos + 1, next);
+    if (/^[ \t]*$/.test(line)) break;
+    if (reUnderlineLine.test(line)) { found = true; break; }
+    pos = next;
+  }
+  if (!found) return null;
   const m = reSetext.exec(src);
   if (!m) return null;
   const text = m[1].trim();
@@ -414,6 +437,32 @@ const reTaskItem = /^\[[ xX]\][ \t]+\S/;
 const reTaskStrip = /^\[[ xX]\][ \t]+/;
 const reCheckbox = /\[[ xX]\]/;
 
+const itemReCache = new Map();
+function itemRegexFor(bulletPattern) {
+  let re = itemReCache.get(bulletPattern);
+  if (!re) {
+    re = new RegExp('^( {0,3}' + bulletPattern + ')((?:[\t ][^\\n]*)?(?:\\n|$))');
+    itemReCache.set(bulletPattern, re);
+  }
+  return re;
+}
+const beginReCache = new Map();
+function beginRegexes(pad) {
+  let set = beginReCache.get(pad);
+  if (!set) {
+    set = {
+      bullet: new RegExp('^ {0,' + pad + '}(?:[*+-]|\\d{1,9}[.)])((?:[ \t][^\\n]*)?(?:\\n|$))'),
+      hr: new RegExp('^ {0,' + pad + '}((?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\\*[ \t]*){3,})(?:\\n+|$)'),
+      fence: new RegExp('^ {0,' + pad + '}(?:```|~~~)'),
+      heading: new RegExp('^ {0,' + pad + '}#{1,6}(?:\\s|$)'),
+      html: new RegExp('^ {0,' + pad + '}(?:<\\/?(?:' + BLOCK_TAGS + ')(?: +|$|\\/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)', 'i'),
+      quote: new RegExp('^ {0,' + pad + '}>'),
+    };
+    beginReCache.set(pad, set);
+  }
+  return set;
+}
+
 function scanList(src, ctx) {
   const first = reListStart.exec(src);
   if (!first) return null;
@@ -423,7 +472,7 @@ function scanList(src, ctx) {
   // Subsequent items must use the same bullet family: same char for
   // bullets, same delimiter for ordered lists.
   const bulletPattern = ordered ? '\\d{1,9}\\' + bullet.slice(-1) : '\\' + bullet;
-  const itemRe = new RegExp('^( {0,3}' + bulletPattern + ')((?:[\t ][^\\n]*)?(?:\\n|$))');
+  const itemRe = itemRegexFor(bulletPattern);
   const list = { kind: 'list', raw: '', ordered, start, loose: false, items: [] };
   let rest = src;
   let endWithBlank = false;
@@ -455,13 +504,9 @@ function scanList(src, ctx) {
       itemDone = true;
     }
     if (!itemDone) {
-      const beginPad = Math.min(indent - 1, 3);
-      const nextBulletRe = new RegExp('^ {0,' + beginPad + '}(?:[*+-]|\\d{1,9}[.)])((?:[ \t][^\\n]*)?(?:\\n|$))');
-      const hrRe = new RegExp('^ {0,' + beginPad + '}((?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\\*[ \t]*){3,})(?:\\n+|$)');
-      const fenceRe = new RegExp('^ {0,' + beginPad + '}(?:```|~~~)');
-      const headingRe = new RegExp('^ {0,' + beginPad + '}#{1,6}(?:\\s|$)');
-      const htmlRe = new RegExp('^ {0,' + beginPad + '}(?:<\\/?(?:' + BLOCK_TAGS + ')(?: +|$|\\/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)', 'i');
-      const quoteRe = new RegExp('^ {0,' + beginPad + '}>');
+      const begin = beginRegexes(Math.min(indent - 1, 3));
+      const nextBulletRe = begin.bullet, hrRe = begin.hr, fenceRe = begin.fence,
+        headingRe = begin.heading, htmlRe = begin.html, quoteRe = begin.quote;
       let wasBlank = blankFirst;
       let prevLine = expanded;
       while (rest) {
@@ -560,7 +605,15 @@ function lexBlocks(src, out, ctx, inQuote = false) {
       }
     }
 
-    if ((tok = scanIndented(src))) {
+    // First-character dispatch: at most three spaces of indent are
+    // possible for every construct except indented code, so the first
+    // non-space character decides which scanners are worth running. The
+    // probe order among the survivors matches the reference's order.
+    let indent = 0;
+    while (src[indent] === ' ') indent++;
+    const fc = src[indent];
+    const codeStart = indent >= 4 || src[0] === '\t' || (indent > 0 && indent < 4 && src[indent] === '\t');
+    if (codeStart && (tok = scanIndented(src))) {
       src = src.substring(tok.raw.length);
       const prev = out[out.length - 1];
       if (prev && (prev.kind === 'paragraph' || prev.kind === 'text')) {
@@ -569,25 +622,25 @@ function lexBlocks(src, out, ctx, inQuote = false) {
       } else out.push(tok);
       continue;
     }
-    if ((tok = scanFence(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
-    if ((tok = scanAtx(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
-    if ((tok = scanThematic(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
-    if (c0 !== '<' || true) {
-      if ((tok = scanQuote(src, ctx))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
-    }
-    if ((tok = scanList(src, ctx))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
-    if ((tok = scanHtmlBlock(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
-    if ((tok = scanDef(src, ctx))) {
-      src = src.substring(tok.raw.length);
-      const prev = out[out.length - 1];
-      if (prev && (prev.kind === 'paragraph' || prev.kind === 'text')) {
-        prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + tok.raw;
-        prev.text += '\n' + tok.raw;
-      } else {
-        if (!Object.hasOwn(ctx.links, tok.tag)) ctx.links[tok.tag] = { href: tok.href, title: tok.title };
-        out.push(tok);
+    if (indent <= 3) {
+      if ((fc === '`' || fc === '~') && (tok = scanFence(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
+      if (fc === '#' && (tok = scanAtx(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
+      if ((fc === '-' || fc === '*' || fc === '_') && (tok = scanThematic(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
+      if (fc === '>' && (tok = scanQuote(src, ctx))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
+      if ((fc === '-' || fc === '*' || fc === '+' || (fc >= '0' && fc <= '9')) && (tok = scanList(src, ctx))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
+      if (fc === '<' && (tok = scanHtmlBlock(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
+      if (fc === '[' && (tok = scanDef(src, ctx))) {
+        src = src.substring(tok.raw.length);
+        const prev = out[out.length - 1];
+        if (prev && (prev.kind === 'paragraph' || prev.kind === 'text')) {
+          prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + tok.raw;
+          prev.text += '\n' + tok.raw;
+        } else {
+          if (!Object.hasOwn(ctx.links, tok.tag)) ctx.links[tok.tag] = { href: tok.href, title: tok.title };
+          out.push(tok);
+        }
+        continue;
       }
-      continue;
     }
     if ((tok = scanTable(src, ctx))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
     if ((tok = scanSetext(src))) { src = src.substring(tok.raw.length); out.push(tok); continue; }
